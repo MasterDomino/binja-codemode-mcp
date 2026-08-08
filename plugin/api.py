@@ -32,6 +32,12 @@ class BinjaAPI:
         self._state = state
         self._workspace = workspace
         self._skills = skills
+        # Output sink for the helper methods that print their result
+        # (print_table, summary). Defaults to the builtin print; the sandbox
+        # executor overrides this per-call with its capturing print so output
+        # from these methods reaches the captured stdout instead of the real
+        # one (which the LLM never sees). See executor.py.
+        self._out: Any = print
 
     # =========================================================================
     # BinaryView-Style Property Aliases
@@ -1371,7 +1377,7 @@ class BinjaAPI:
         """
         if not data:
             result = "(no data)"
-            print(result)
+            self._out(result)
             return result
 
         # Auto-detect columns from first row
@@ -1427,7 +1433,7 @@ class BinjaAPI:
             lines.append(f"... ({len(data) - max_rows} more rows)")
 
         result = "\n".join(lines)
-        print(result)
+        self._out(result)
         return result
 
     def fmt_addr(self, addr: int, width: int = 8) -> str:
@@ -1507,7 +1513,7 @@ class BinjaAPI:
         else:
             result = str(data)
 
-        print(result)
+        self._out(result)
         return result
 
     # =========================================================================

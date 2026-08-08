@@ -266,6 +266,15 @@ class CodeExecutor:
             "False": False,
         }
 
+        # Route the helper methods that print their own result (print_table,
+        # summary) through the same capturing print as top-level `print`.
+        # Those methods live on the BinjaAPI object and resolve a bare `print`
+        # via the *plugin module's* __builtins__ (real stdout), not these
+        # sandbox globals — so without this, binja.print_table(data) succeeds
+        # but its output never reaches the captured StringIO the LLM reads.
+        # self._out defaults to builtin print; override it for this call only.
+        self.api._out = progress_print
+
         # Execute with timeout
         result_holder = {"result": None, "error": None}
 
