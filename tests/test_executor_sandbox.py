@@ -52,7 +52,14 @@ def _load_executor():
 
 
 class _FakeAPI:
-    """Stand-in for BinjaAPI - the executor never calls it for these tests."""
+    """Stand-in for BinjaAPI.
+
+    The executor exposes ``self.api.bv`` directly in the sandbox namespace
+    (mirroring ``BinjaAPI.bv``), so the fake must provide a ``bv`` attribute
+    even though no test exercises the real BinaryView through it.
+    """
+
+    bv = None
 
 
 def _make_executor():

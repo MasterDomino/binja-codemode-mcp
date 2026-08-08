@@ -218,6 +218,7 @@ class CodeExecutor:
         restricted_globals = {
             "__builtins__": safe_builtins,
             "binja": self.api,
+            "bv": self.api.bv,  # Direct BinaryView access (common in BN scripts)
             "print": progress_print,
             "None": None,
             "True": True,
