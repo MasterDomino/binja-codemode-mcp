@@ -1,18 +1,16 @@
 """Binary Ninja API wrapper for LLM code execution."""
 
-from typing import TYPE_CHECKING, Any
+import re
+from typing import TYPE_CHECKING
+
+from binaryninja import Function
 
 if TYPE_CHECKING:
     from binaryninja import BinaryView
 
-    from .state import StateTracker
-    from .workspace import SkillsManager, WorkspaceManager
-
 
 class BinjaAPIError(Exception):
     """Custom exception for API errors with detailed messages."""
-
-    pass
 
 
 class BinjaAPI:
@@ -21,289 +19,48 @@ class BinjaAPI:
     All methods operate on the current BinaryView.
     """
 
-    def __init__(
-        self,
-        bv: "BinaryView",
-        state: "StateTracker",
-        workspace: "WorkspaceManager",
-        skills: "SkillsManager",
-    ):
+    def __init__(self, bv: "BinaryView"):
         self._bv = bv
-        self._state = state
-        self._workspace = workspace
-        self._skills = skills
+        # name -> how many committed transactions deep the database was. Deliberately in memory
+        # only: the undo stack outlives the session in the .bndb, so a depth saved to disk could
+        # be meaningfully wrong on reload, while one held here can only be from this session.
+        self._checkpoints: dict[str, int] = {}
+
+    @property
+    def bv(self):
+        """The BinaryView these methods operate on.
+
+        For the tool description's context header, which has a binary to describe but only the
+        namespace mapping to reach it through. Not part of the model's surface: api_surface()
+        renders routines, and the executor binds `bv` into the namespace itself.
+        """
+        return self._bv
 
     # =========================================================================
     # Query Operations (read-only)
     # =========================================================================
 
-    def get_binary_status(self) -> dict[str, Any]:
-        """Get current binary metadata."""
-        return {
-            "filename": self._bv.file.filename,
-            "architecture": self._bv.arch.name if self._bv.arch else None,
-            "platform": self._bv.platform.name if self._bv.platform else None,
-            "entry_point": self._bv.entry_point,
-            "function_count": len(self._bv.functions),
-            "start": self._bv.start,
-            "end": self._bv.end,
-        }
-
-    def list_functions(
-        self,
-        limit: int | None = None,
-        min_size: int | None = None,
-        max_size: int | None = None,
-        name_contains: str | None = None,
-        has_calls_to: str | None = None,
-        offset: int = 0,
-    ) -> list[dict[str, Any]]:
-        """List functions with optional filtering and pagination.
-
-        Args:
-            limit: Maximum number of results (default: None = all)
-            offset: Number of results to skip (default: 0)
-            min_size: Minimum function size in bytes (default: None = no filter)
-            max_size: Maximum function size in bytes (default: None = no filter)
-            name_contains: Filter by name substring (default: None = no filter)
-            has_calls_to: Filter to functions that call this function name (default: None = no filter)
-
-        Returns:
-            List of function dicts with name, address, size
-        """
-        results = []
-
-        for f in self._bv.functions:
-            # Apply filters
-            if min_size is not None and f.total_bytes < min_size:
-                continue
-            if max_size is not None and f.total_bytes > max_size:
-                continue
-            if (
-                name_contains is not None
-                and name_contains.lower() not in f.name.lower()
-            ):
-                continue
-            if has_calls_to is not None:
-                # Check if this function calls the target
-                target_lower = has_calls_to.lower()
-                calls_target = any(
-                    target_lower in callee.name.lower() for callee in f.callees
-                )
-                if not calls_target:
-                    continue
-
-            results.append({"name": f.name, "address": f.start, "size": f.total_bytes})
-
-        # Apply pagination
-        if offset:
-            results = results[offset:]
-        if limit is not None:
-            results = results[:limit]
-
-        return results
-
-    def analyze_functions_batch(
-        self,
-        batch_size: int = 100,
-        offset: int = 0,
-        include_calls: bool = False,
-        include_xrefs: bool = False,
-        min_size: int | None = None,
-        max_size: int | None = None,
-        name_contains: str | None = None,
-        has_calls_to: str | None = None,
-    ) -> dict:
-        """Analyze functions in batches to avoid timeouts.
-
-        Args:
-            batch_size: Number of functions to analyze per batch (default: 100)
-            offset: Starting offset in function list (default: 0)
-            include_calls: Include function calls in results
-            include_xrefs: Include cross-references in results
-            min_size: Minimum function size in bytes
-            max_size: Maximum function size in bytes
-            name_contains: Filter by name substring
-            has_calls_to: Filter to functions calling this function
-
-        Returns:
-            dict with 'functions' list, 'total_count', 'batch_size', 'offset', 'has_more'
-        """
-        # Get filtered function list
-        all_funcs = self.list_functions(
-            limit=None,
-            offset=0,
-            min_size=min_size,
-            max_size=max_size,
-            name_contains=name_contains,
-            has_calls_to=has_calls_to,
-        )
-        total_count = len(all_funcs)
-
-        # Apply batch pagination
-        batch_end = min(offset + batch_size, total_count)
-        batch_funcs = all_funcs[offset:batch_end]
-
-        results = []
-        for func_info in batch_funcs:
-            result = func_info.copy()
-
-            if include_calls:
-                try:
-                    result["calls"] = self.get_function_calls(func_info["name"])
-                except Exception as e:
-                    result["calls_error"] = str(e)
-
-            if include_xrefs:
-                try:
-                    result["xrefs_to"] = self.get_xrefs_to(func_info["name"])
-                except Exception as e:
-                    result["xrefs_error"] = str(e)
-
-            results.append(result)
-
-        return {
-            "functions": results,
-            "total_count": total_count,
-            "batch_size": batch_size,
-            "offset": offset,
-            "has_more": batch_end < total_count,
-            "next_offset": batch_end if batch_end < total_count else None,
-        }
-
-    def list_imports(self, limit: int | None = None, offset: int = 0) -> list[dict]:
-        """List imported symbols."""
-        from binaryninja import SymbolType
-
-        results = []
-        for sym in self._bv.get_symbols_of_type(SymbolType.ImportedFunctionSymbol):
-            results.append(
-                {
-                    "name": sym.name,
-                    "address": sym.address,
-                    "namespace": sym.namespace if sym.namespace else None,
-                }
-            )
-
-        if offset:
-            results = results[offset:]
-        if limit is not None:
-            results = results[:limit]
-
-        return results
-
-    def list_exports(self, limit: int | None = None, offset: int = 0) -> list[dict]:
-        """List exported symbols."""
-        from binaryninja import SymbolBinding, SymbolType
-
-        results = []
-        for sym in self._bv.get_symbols_of_type(SymbolType.FunctionSymbol):
-            if sym.binding == SymbolBinding.GlobalBinding:
-                results.append({"name": sym.name, "address": sym.address})
-
-        if offset:
-            results = results[offset:]
-        if limit is not None:
-            results = results[:limit]
-
-        return results
-
-    def list_segments(self, limit: int | None = None, offset: int = 0) -> list[dict]:
-        """List memory segments."""
-        results = [
-            {
-                "start": seg.start,
-                "end": seg.end,
-                "length": seg.length,
-                "readable": seg.readable,
-                "writable": seg.writable,
-                "executable": seg.executable,
-            }
-            for seg in self._bv.segments
-        ]
-
-        if offset:
-            results = results[offset:]
-        if limit is not None:
-            results = results[:limit]
-
-        return results
-
-    def list_classes(self, limit: int | None = None, offset: int = 0) -> list[str]:
-        """List class/namespace names."""
-        results = []
-        for name, t in self._bv.types:
-            if hasattr(t, "structure") and t.structure:
-                results.append(str(name))
-
-        if offset:
-            results = results[offset:]
-        if limit is not None:
-            results = results[:limit]
-
-        return results
-
-    def list_namespaces(self, limit: int | None = None, offset: int = 0) -> list[str]:
-        """List non-global namespaces."""
-        namespaces = set()
-        for sym in self._bv.get_symbols():
-            if sym.namespace:
-                namespaces.add(sym.namespace)
-        results = list(namespaces)
-
-        if offset:
-            results = results[offset:]
-        if limit is not None:
-            results = results[:limit]
-
-        return results
-
-    def list_data_items(self) -> list[dict]:
-        """List defined data labels."""
-        from binaryninja import SymbolType
-
-        results = []
-        for sym in self._bv.get_symbols_of_type(SymbolType.DataSymbol):
-            results.append(
-                {
-                    "name": sym.name,
-                    "address": sym.address,
-                }
-            )
-        return results
-
-    def decompile(self, func: str | int, il_level: str = "hlil") -> str | None:
+    def decompile(self, func: "Function | str | int", il_level: str = "hlil") -> str | None:
         """Decompile function to C-like pseudocode.
 
         Args:
             func: Function name or address
             il_level: IL level - "hlil" (high), "mlil" (medium), or "llil" (low)
-
-        Returns:
-            Decompiled code or None if function not found
         """
         # Validate il_level parameter
         valid_levels = ["hlil", "mlil", "llil"]
         if il_level not in valid_levels:
-            raise ValueError(
-                f"il_level must be one of {valid_levels}, got '{il_level}'"
-            )
+            raise ValueError(f"il_level must be one of {valid_levels}, got '{il_level}'")
 
         f = self._resolve_function(func)
         if not f:
             return None
 
-        lines = [f"// {f.name} @ {f.start:#x}", str(f.type)]
-
-        # Add variable definitions (only for HLIL)
-        if il_level == "hlil" and f.vars:
-            lines.append("// Variables:")
-            for var in f.vars:
-                var_type = str(var.type) if var.type else "auto"
-                lines.append(f"//   {var_type} {var.name}")
-            lines.append("")
-
-        lines.append("{")
+        # No variable listing: HLIL already declares each variable inline with its type at first
+        # assignment, so the block repeated what the body says, and most of what it named was
+        # compiler temporaries. It was 41% of this method's output. binja.function(f).vars still
+        # has them for the rare case that wants the whole set.
+        lines = [f"// {f.name} @ {f.start:#x}", str(f.type), "{"]
 
         # Handle different IL levels with their specific APIs
         if il_level == "mlil" and f.mlil:
@@ -325,7 +82,7 @@ class BinjaAPI:
 
         return result
 
-    def get_assembly(self, func: str | int) -> str | None:
+    def get_assembly(self, func: "Function | str | int") -> str | None:
         """Get disassembly for function."""
         f = self._resolve_function(func)
         if not f:
@@ -338,634 +95,534 @@ class BinjaAPI:
                 lines.append(f"{instr.address:#x}: {text}")
         return "\n".join(lines)
 
-    def get_xrefs_to(self, func: str | int) -> list[dict]:
-        """Get cross-references to function (callers)."""
-        f = self._resolve_function(func)
-        if not f:
-            return []
+    def get_all_xrefs(
+        self, addr: int, include_data: bool = True, include_code: bool = True
+    ) -> dict:
+        """Get all cross-references (both code and data) to/from one address, not a whole function.
 
-        results = []
-        for ref in self._bv.get_code_refs(f.start):
-            caller = self._bv.get_functions_containing(ref.address)
-            if caller:
-                results.append(
+        Asked for a function's entry point it reports what jumps or calls there, and `xrefs_from`
+        covers that one address rather than the whole body, so it is usually empty. For what a
+        function calls, read `binja.function(f).callees`.
+
+        Args:
+            addr: Address to analyze
+            include_data: Include data references (default: True)
+            include_code: Include code references (default: True)
+
+        Returns:
+            {address, xrefs_to: [{type, from_address, from_function}], xrefs_from: [{type, to_address, to_function}]}
+        """
+        xrefs_to = []
+        xrefs_from = []
+
+        if include_code:
+            # get_code_refs() points inward and get_code_refs_from() outward, the same split the
+            # data refs get below. Without the second, a call site reported nothing leaving it and
+            # `include_code` reached only half of what it names.
+            for ref in self._bv.get_code_refs(addr):
+                caller = self._bv.get_functions_containing(ref.address)
+                xrefs_to.append(
                     {
-                        "from_function": caller[0].name,
+                        "type": "code",
                         "from_address": ref.address,
+                        "from_function": caller[0].name if caller else None,
                     }
                 )
-        return results
-
-    def get_data_xrefs_to(self, addr: int) -> list[dict]:
-        """Get cross-references to data address."""
-        results = []
-        for ref in self._bv.get_code_refs(addr):
-            caller = self._bv.get_functions_containing(ref.address)
-            if caller:
-                results.append(
+            for ref in self._bv.get_code_refs_from(addr):
+                target = self._bv.get_functions_containing(ref)
+                xrefs_from.append(
                     {
-                        "from_function": caller[0].name,
-                        "from_address": ref.address,
+                        "type": "code",
+                        "to_address": ref,
+                        "to_function": target[0].name if target else None,
                     }
                 )
-        return results
 
-    def get_data_xrefs_from(self, addr: int) -> list[dict]:
-        """Get data references from address."""
-        results = []
-        for ref in self._bv.get_data_refs(addr):
-            results.append({"to_address": ref})
-        return results
-
-    def function_at(self, addr: int | str) -> str | None:
-        """Get function name containing address.
-
-        Args:
-            addr: Address as integer or hex string (e.g., 0x1000 or "0x1000")
-
-        Returns:
-            Function name or None if not found
-        """
-        if isinstance(addr, str):
-            try:
-                addr = int(addr, 16) if addr.startswith("0x") else int(addr)
-            except ValueError:
-                return None
-
-        funcs = self._bv.get_functions_containing(addr)
-        return funcs[0].name if funcs else None
-
-    def get_comment(self, addr: int) -> str | None:
-        """Get comment at address."""
-        return self._bv.get_comment_at(addr)
-
-    def get_function_comment(self, func: str | int) -> str | None:
-        """Get function-level comment."""
-        f = self._resolve_function(func)
-        return f.comment if f else None
-
-    def get_type(self, name: str) -> str | None:
-        """Get user-defined type definition.
-
-        Args:
-            name: Type name to look up
-
-        Returns:
-            Type definition string or None if not found
-
-        Note:
-            This only returns user-defined types. Built-in C types like
-            'int', 'char', 'void' will return None. Use define_type() to
-            create custom types first.
-        """
-        t = self._bv.get_type_by_name(name)
-        return str(t) if t else None
-
-    def read_bytes(self, addr: int, length: int) -> bytes | None:
-        """Read raw bytes from address."""
-        try:
-            data = self._bv.read(addr, length)
-            return data if data else None
-        except Exception:
-            return None
-
-    def read_string(self, addr: int, max_length: int = 256) -> str | None:
-        """Read null-terminated string from address."""
-        try:
-            data = self._bv.read(addr, max_length)
-            if not data:
-                return None
-            # Find null terminator
-            null_idx = data.find(b"\x00")
-            if null_idx >= 0:
-                data = data[:null_idx]
-            # Try to decode as UTF-8, fallback to latin-1
-            try:
-                return data.decode("utf-8")
-            except UnicodeDecodeError:
-                return data.decode("latin-1", errors="replace")
-        except Exception:
-            return None
-
-    def get_data_var_at(self, addr: int) -> dict | None:
-        """Get data variable info at address."""
-        try:
-            var = self._bv.get_data_var_at(addr)
-            if var:
-                return {
-                    "address": var.address,
-                    "type": str(var.type) if var.type else None,
-                    "name": var.name if hasattr(var, "name") else None,
-                }
-            return None
-        except Exception:
-            return None
-
-    def get_string_at(self, addr: int) -> str | None:
-        """Get string defined at address (if any)."""
-        try:
-            string_ref = self._bv.get_string_at(addr)
-            if string_ref:
-                return str(string_ref)
-            return None
-        except Exception:
-            return None
-
-    def get_function_calls(self, func: str | int) -> list[dict]:
-        """Get list of functions called by this function."""
-        f = self._resolve_function(func)
-        if not f:
-            return []
-
-        results = []
-        seen = set()
-
-        # Use callees property (most reliable)
-        for callee in f.callees:
-            if callee.start not in seen:
-                seen.add(callee.start)
-                results.append({"to_function": callee.name, "to_address": callee.start})
-
-        # Also check for unresolved calls
-        if f.hlil:
-            for block in f.hlil:
-                for instr in block:
-                    if hasattr(instr, "dest"):
-                        # Handle direct calls
-                        if hasattr(instr.dest, "constant"):
-                            target_addr = instr.dest.constant
-                            if target_addr not in seen:
-                                seen.add(target_addr)
-                                target_funcs = self._bv.get_functions_containing(
-                                    target_addr
-                                )
-                                if target_funcs:
-                                    results.append(
-                                        {
-                                            "to_function": target_funcs[0].name,
-                                            "to_address": target_addr,
-                                        }
-                                    )
-                                else:
-                                    # Unresolved call - still report it
-                                    results.append(
-                                        {
-                                            "to_function": f"sub_{target_addr:x}",
-                                            "to_address": target_addr,
-                                        }
-                                    )
-
-        return results
-
-    def get_basic_blocks(self, func: str | int) -> list[dict]:
-        """Get basic block info for function."""
-        f = self._resolve_function(func)
-        if not f:
-            return []
-
-        results = []
-        for block in f.basic_blocks:
-            results.append(
-                {
-                    "start": block.start,
-                    "end": block.end,
-                    "length": block.length,
-                    "instruction_count": len(block),
-                }
-            )
-        return results
-
-    def find_bytes(
-        self, pattern: bytes, start: int | None, end: int | None, limit: int = 100
-    ) -> list[int]:
-        """Search for byte pattern in binary. Returns list of addresses.
-
-        Args:
-            pattern: Byte sequence to search for
-            start: Start address (default: binary start)
-            end: End address (default: binary end)
-            limit: Maximum results to return (default: 100)
-
-        Returns:
-            List of addresses where pattern was found (max 100 results)
-        """
-        if start is None:
-            start = self._bv.start
-        if end is None:
-            end = self._bv.end
-
-        results = []
-        current = start
-
-        while current < end and len(results) < limit:
-            found = self._bv.find_next_data(current, pattern)
-            if found is None or found >= end:
-                break
-            results.append(found)
-            current = found + 1
-
-        return results
-
-    def list_strings(
-        self, limit: int | None, min_length: int = 4, offset: int = 0
-    ) -> list[dict]:
-        """List strings in binary with pagination.
-
-        Args:
-            min_length: Minimum string length (default: 4)
-            limit: Maximum number of results (default: None = all)
-            offset: Number of results to skip (default: 0)
-
-        Returns:
-            List of string dicts with address, value, length, type
-        """
-        results = []
-        for s in self._bv.strings:
-            if s.length >= min_length:
-                results.append(
+        if include_data:
+            for ref in self._bv.get_data_refs(addr):
+                source = self._bv.get_functions_containing(ref)
+                xrefs_to.append(
                     {
-                        "address": s.start,
-                        "value": str(s),
-                        "length": s.length,
-                        "type": s.type.name if hasattr(s.type, "name") else str(s.type),
+                        "type": "data",
+                        "from_address": ref,
+                        "from_function": source[0].name if source else None,
+                    }
+                )
+            for ref in self._bv.get_data_refs_from(addr):
+                target = self._bv.get_functions_containing(ref)
+                xrefs_from.append(
+                    {
+                        "type": "data",
+                        "to_address": ref,
+                        "to_function": target[0].name if target else None,
                     }
                 )
 
-        # Apply pagination
-        if offset:
-            results = results[offset:]
-        if limit is not None:
-            results = results[:limit]
+        return {"address": addr, "xrefs_to": xrefs_to, "xrefs_from": xrefs_from}
 
-        return results
+    def function(self, func: "Function | str | int"):
+        """Get the Function object for a name or an address, for work these methods do not cover.
+
+        The real Binary Ninja object, not a rendered dict: read and assign its attributes
+        directly, as in binja.function("main").name = "parse_header". Every `func` argument
+        takes the same forms, including a Function itself, so one can be passed straight on.
+
+        Returns:
+            A binaryninja.Function, or None if nothing resolves
+        """
+        return self._resolve_function(func)
 
     # =========================================================================
     # Mutation Operations (tracked)
     # =========================================================================
 
-    def rename_function(self, func: str | int, new_name: str) -> bool:
-        """Rename a function."""
-        f = self._resolve_function(func)
-        if not f:
-            return False
+    def define_type(self, c_definition: str) -> list[str]:
+        """Define types from C syntax, and name the ones it defined.
 
-        old_name = f.name
-        f.name = new_name
-        self._state.record_change(f"rename function: {old_name} -> {new_name}")
-        return True
+        A bare True said only that nothing raised, which C declaring no type at all satisfies:
+        `int x;` is a variable and a comment is nothing, and both answered True having defined
+        nothing. An empty list is the honest answer to those, and the parser's own diagnostic,
+        with a line and a column, is what comes back when the C does not parse.
 
-    def rename_data(self, addr: int, new_name: str) -> bool:
-        """Rename data label at address."""
-        from binaryninja import Symbol
-
-        sym = self._bv.get_symbol_at(addr)
-        if not sym:
-            return False
-
-        old_name = sym.name
-        self._bv.define_user_symbol(Symbol(sym.type, addr, new_name))
-        self._state.record_change(f"rename data: {old_name} -> {new_name}")
-        return True
-
-    def rename_variable(self, func: str | int, old_name: str, new_name: str) -> bool:
-        """Rename variable within function."""
-        f = self._resolve_function(func)
-        if not f:
-            return False
-
-        for var in f.vars:
-            if var.name == old_name:
-                var.name = new_name
-                self._state.record_change(
-                    f"rename var in {f.name}: {old_name} -> {new_name}"
-                )
-                return True
-        return False
-
-    def retype_variable(self, func: str | int, var_name: str, new_type: str) -> bool:
-        """Change variable type within function."""
-        f = self._resolve_function(func)
-        if not f:
-            return False
-
-        parsed_type, _ = self._bv.parse_type_string(new_type)
-        if not parsed_type:
-            return False
-
-        for var in f.vars:
-            if var.name == var_name:
-                var.type = parsed_type
-                self._state.record_change(
-                    f"retype var {var_name} in {f.name} to {new_type}"
-                )
-                return True
-        return False
-
-    def set_comment(self, addr: int, comment: str) -> bool:
-        """Set comment at address."""
-        self._bv.set_comment_at(addr, comment)
-        self._state.record_change(f"comment at {addr:#x}")
-        return True
-
-    def set_function_comment(self, func: str | int, comment: str) -> bool:
-        """Set function-level comment."""
-        f = self._resolve_function(func)
-        if not f:
-            return False
-
-        f.comment = comment
-        self._state.record_change(f"comment on {f.name}")
-        return True
-
-    def delete_comment(self, addr: int) -> bool:
-        """Delete comment at address."""
-        self._bv.set_comment_at(addr, "")
-        self._state.record_change(f"delete comment at {addr:#x}")
-        return True
-
-    def delete_function_comment(self, func: str | int) -> bool:
-        """Delete function comment."""
-        f = self._resolve_function(func)
-        if not f:
-            return False
-
-        f.comment = ""
-        self._state.record_change(f"delete comment on {f.name}")
-        return True
-
-    def define_type(self, c_definition: str) -> bool:
-        """Define type from C syntax."""
-        try:
-            types = self._bv.parse_types_from_string(c_definition)
-            for name, t in types.types.items():
-                self._bv.define_user_type(name, t)
-                self._state.record_change(f"define type: {name}")
-            return True
-        except Exception:
-            return False
-
-    def set_function_signature(self, func: str | int, signature: str) -> bool:
-        """Set function prototype."""
-        f = self._resolve_function(func)
-        if not f:
-            return False
-
-        try:
-            parsed_type, _ = self._bv.parse_type_string(signature)
-            if parsed_type:
-                f.type = parsed_type
-                self._state.record_change(f"signature on {f.name}: {signature}")
-                return True
-        except Exception:
-            pass
-        return False
-
-    # =========================================================================
-    # Workspace Operations
-    # =========================================================================
-
-    def write_file(self, name: str, content: str) -> bool:
-        """Write content to workspace file."""
-        return self._workspace.write(name, content)
-
-    def read_file(self, name: str) -> str | None:
-        """Read content from workspace file."""
-        return self._workspace.read(name)
-
-    def list_files(self) -> list[dict]:
-        """List workspace files."""
-        return self._workspace.list()
-
-    def delete_file(self, name: str) -> bool:
-        """Delete a workspace file."""
-        return self._workspace.delete(name)
-
-    def list_open_views(self) -> list[dict]:
-        """Enumerate every binary open in the Binary Ninja GUI tabs.
-
-        Returns one dict per open view: {filename, short_name, start, end,
-        function_count, is_active}. `is_active` marks the view this API is
-        currently pinned to (``self._bv``). Returns an empty list (and never
-        raises) when the UI is unavailable - e.g. headless/no-GUI runs where
-        ``binaryninjaui`` cannot be imported.
-
-        Note: ``list_files()`` lists workspace files, NOT open binaries - the
-        two are unrelated and the names are easy to confuse.
+        Returns:
+            [name, ...] for each type defined, empty when the C declared none
         """
-        try:
-            import binaryninjaui
-        except Exception:
-            return []
+        parsed = self._bv.parse_types_from_string(c_definition)
+        for name, type_ in parsed.types.items():
+            self._bv.define_user_type(name, type_)
+        return [str(name) for name in parsed.types]
 
-        try:
-            active_short = self._bv.file.filename.split("/")[-1]
-        except Exception:
-            active_short = None
+    def set_function_signature(self, func: "Function | str | int", signature: str) -> bool:
+        """Set function prototype, and wait for the analysis that makes it visible.
 
-        views = []
-        try:
-            for ctx in binaryninjaui.UIContext.allContexts():
-                get_tabs = getattr(ctx, "getTabs", None)
-                tabs = get_tabs() if callable(get_tabs) else []
-                for tab in tabs:
-                    vf = ctx.getViewFrameForTab(tab)
-                    if vf is None:
-                        continue
-                    bv = getattr(vf, "getCurrentBinaryView", lambda: None)()
-                    if bv is None:
-                        continue
-                    short = bv.file.filename.split("/")[-1]
-                    views.append(
-                        {
-                            "filename": bv.file.filename,
-                            "short_name": short,
-                            "start": bv.start,
-                            "end": bv.end,
-                            "function_count": len(list(bv.functions)),
-                            "is_active": short == active_short,
-                        }
-                    )
-        except Exception:
-            # A UI API change should not crash the sandbox; return what we have.
-            pass
+        Assigning a function type only queues reanalysis, so reading the signature back in the
+        same call returns the old one. This waits, which is the whole reason the method is still
+        here: True means the new signature is in effect, not that it has been scheduled.
 
-        return views
+        Args:
+            func: Function name or address
+            signature: Function signature string (e.g., "int foo(char* bar)")
+
+        Returns:
+            True, or False if the function does not resolve; a signature that does not parse raises
+        """
+        f = self._resolve_function(func)
+        if not f:
+            return False
+
+        # parse_type_string raises SyntaxError naming the line and column it gave up at. Letting it
+        # out is the entire diagnostic: caught, the caller was left a bare False to guess at.
+        parsed_type, _ = self._bv.parse_type_string(signature)
+        f.type = parsed_type
+        self._bv.update_analysis_and_wait()
+        return True
 
     # =========================================================================
-    # Skills Operations
+    # Checkpoints
     # =========================================================================
 
-    def save_skill(self, name: str, code: str, description: str) -> bool:
-        """Save reusable analysis code as a skill."""
-        return self._skills.save(name, code, description)
+    def checkpoint(self, name: str) -> bool:
+        """Name the current state of the database so a later rollback can return to it. Lasts as long as the server runs.
 
-    def load_skill(self, name: str) -> dict | None:
-        """Load a skill."""
-        skill = self._skills.load(name)
-        if skill:
-            return {
-                "name": skill.name,
-                "description": skill.description,
-                "code": skill.code,
-            }
-        return None
+        Covers changes made through `bv` directly as well as through these methods, because
+        Binary Ninja commits every mutation as its own undo entry. For atomicity inside a single
+        call, `with bv.undoable_transaction():` is cheaper and reverts itself on an exception.
 
-    def list_skills(self) -> list[dict]:
-        """List available skills."""
-        return self._skills.list()
+        Stopping the server forgets the names, while the undo stack they point into survives in
+        the database, so a name from before a restart is gone rather than stale and rollback()
+        answers False.
 
-    def delete_skill(self, name: str) -> bool:
-        """Delete a skill."""
-        return self._skills.delete(name)
+        Returns:
+            True, or False if the name is empty or already taken
+        """
+        if not name or name in self._checkpoints:
+            return False
+        self._checkpoints[name] = self._undo_depth()
+        return True
+
+    def rollback(self, name: str) -> bool:
+        """Undo every change made since the named checkpoint, discarding later checkpoints.
+
+        Waits for analysis before returning, so a reverted function signature reads back as the
+        old one rather than needing another call to become visible.
+
+        Returns:
+            True, or False if no checkpoint of that name exists
+        """
+        if name not in self._checkpoints:
+            return False
+
+        # Undo back down to the recorded depth rather than a counted number of actions, so a redo
+        # or a change made in the GUI cannot leave the two out of step. A depth below the current
+        # one yields an empty range, which is what keeps a stale checkpoint from undoing work that
+        # predates it.
+        for _ in range(self._undo_depth() - self._checkpoints[name]):
+            self._bv.undo()
+
+        # Undoing a function type change only queues the reanalysis that makes it visible, the
+        # same way setting one does.
+        self._bv.update_analysis_and_wait()
+
+        taken_at = self._checkpoints[name]
+        self._checkpoints = {
+            key: depth for key, depth in self._checkpoints.items() if depth <= taken_at
+        }
+        return True
+
+    def delete_checkpoint(self, name: str) -> bool:
+        """Forget a checkpoint without undoing anything.
+
+        Rollback discards the checkpoints taken after the one it returns to, and keeps the rest,
+        so a session that guards several batches accumulates names it will not use again. Each
+        one is listed in this tool's description on every call, which is what makes forgetting
+        them worth a method.
+
+        Returns:
+            True, or False if no checkpoint of that name exists
+        """
+        return self._checkpoints.pop(name, None) is not None
+
+    def list_checkpoints(self) -> list[dict]:
+        """List saved checkpoints, oldest first.
+
+        Returns:
+            [{name, undo_depth}, ...]
+        """
+        return [{"name": name, "undo_depth": depth} for name, depth in self._checkpoints.items()]
+
+    def _undo_depth(self) -> int:
+        """How many committed transactions deep the database currently is.
+
+        Commits first. A mutation made outside an explicit transaction sits in an anonymous one
+        that Binary Ninja commits at its own pace, so measuring without committing misses
+        everything the calling code has just done: a checkpoint would record a depth from before
+        its own call's work, and a rollback in that same call would undo nothing while reporting
+        success. Committing is safe inside a `with bv.undoable_transaction():`, which still
+        reverts its own block on an exception.
+        """
+        self._bv.commit_undo_actions()
+        return len(self._bv.file.undo_entries)
 
     # =========================================================================
     # Helpers
     # =========================================================================
 
-    def _resolve_function(self, func: str | int, raise_on_error: bool = False):
-        """Resolve function by name or address.
+    def _function_at_address(self, addr: int):
+        """The function starting at addr, else whichever function contains it.
 
-        Args:
-            func: Function name or address
-            raise_on_error: If True, raise BinjaAPIError instead of returning None
+        get_functions_containing() on its own is wrong wherever two functions share a basic
+        block: asked for an address that is one function's entry point it can answer with a
+        different function that merely covers it, and the caller then decompiles, renames or
+        patches the wrong function with nothing to show that it did.
+        """
+        exact = self._bv.get_function_at(addr)
+        if exact is not None:
+            return exact
+        containing = self._bv.get_functions_containing(addr)
+        return containing[0] if containing else None
+
+    def _resolve_function(self, func):
+        """Resolve a Function, a name or an address to the Function it names.
+
+        A Function passes straight through. binja.function() hands one back and the guide says so,
+        which makes handing it to the next method the obvious next line; resolving only strings and
+        addresses turned that line into None, and the caller then read it as "no such function".
 
         Returns:
             Function object or None if not found
-
-        Raises:
-            BinjaAPIError: If raise_on_error=True and function not found
         """
+        if isinstance(func, Function):
+            return func
+
         if isinstance(func, int):
-            funcs = self._bv.get_functions_containing(func)
-            if not funcs:
-                if raise_on_error:
-                    raise BinjaAPIError(f"No function found at address {func:#x}")
-                return None
-            return funcs[0]
-        elif isinstance(func, str):
-            # Try to parse as hex string first
-            try:
-                addr = int(func, 16) if func.startswith("0x") else int(func)
-                funcs = self._bv.get_functions_containing(addr)
-                if funcs:
-                    return funcs[0]
-                if raise_on_error:
-                    raise BinjaAPIError(f"No function found at address {addr:#x}")
-                return None
-            except ValueError:
-                pass  # Not an address, treat as name
+            return self._function_at_address(func)
 
-            # Search by function name
-            for f in self._bv.functions:
-                if f.name == func:
-                    return f
-
-            if raise_on_error:
-                # Suggest similar names
-                similar = [
-                    f.name for f in self._bv.functions if func.lower() in f.name.lower()
-                ]
-                if similar:
-                    suggestions = ", ".join(similar[:5])
-                    raise BinjaAPIError(
-                        f"Function '{func}' not found. Similar: {suggestions}"
-                    )
-                else:
-                    raise BinjaAPIError(
-                        f"Function '{func}' not found. Use list_functions() to see available functions."
-                    )
+        if not isinstance(func, str):
             return None
 
-        # Neither string nor int
-        return None
+        # An address first, in either of the cases a hex literal gets written in.
+        try:
+            return self._function_at_address(
+                int(func, 16) if func[:2].lower() == "0x" else int(func)
+            )
+        except ValueError:
+            pass  # Not an address, treat as name
+
+        # By name through the core's index. Scanning bv.functions is linear in the size of the
+        # binary and this runs once per call, so a loop over names was quadratic in it. The exact
+        # match comes first, because the index also answers to a name a function has since been
+        # renamed away from.
+        matches = self._bv.get_functions_by_name(func)
+        for match in matches:
+            if match.name == func:
+                return match
+        return matches[0] if matches else None
 
     # =========================================================================
-    # Common analysis patterns
+    # Discovery
     # =========================================================================
-    def find_functions_calling_unsafe(
-        self, unsafe_patterns: list[str] | None = None
-    ) -> list[dict[str, Any]]:  # Changed return type for consistency
-        """Find all functions calling potentially unsafe functions.
 
-        Args:
-            unsafe_patterns: List of function name patterns (default: common unsafe funcs)
+    def list_methods(self) -> str:
+        """List every method callable here, with signatures and summaries."""
+        from . import tools
+        from .workspace import SkillsManager, WorkspaceManager
 
-        Returns:
-            list of dicts with 'function_name', 'address', 'unsafe_calls'
+        # The classes rather than the live managers: this only renders signatures, and reaching
+        # the instances would mean holding references the API no longer has any other use for.
+        return tools.build_api_reference(
+            {"binja": self, "workspace": WorkspaceManager, "skills": SkillsManager}
+        )
 
-        Example:
-            [
-                {
-                    'function_name': 'main',
-                    'address': 0x1000,
-                    'unsafe_calls': ['strcpy', 'sprintf']
-                },
-                ...
-            ]
-        """
-        if unsafe_patterns is None:
-            unsafe_patterns = [
-                "strcpy",
-                "strcat",
-                "sprintf",
-                "gets",
-                "scanf",
-                "memcpy",
-                "memmove",
-                "malloc",
-                "free",
-                "realloc",
-            ]
+    def search_api(self, query: str, limit: int = 40) -> list[dict]:
+        """Search Binary Ninja's own API by keyword, for what the methods above do not cover.
 
-        results = []
-
-        for func in self._bv.functions:
-            unsafe_calls = []
-
-            for callee in func.callees:
-                callee_name_lower = callee.name.lower()
-                for pattern in unsafe_patterns:
-                    if pattern.lower() in callee_name_lower:
-                        unsafe_calls.append(callee.name)
-                        break
-
-            if unsafe_calls:
-                results.append(
-                    {
-                        "function_name": func.name,
-                        "address": func.start,
-                        "unsafe_calls": unsafe_calls,
-                    }
-                )
-
-        return results
-
-    def get_function_complexity(self, func: str | int) -> dict | None:
-        """Get complexity metrics for a function.
+        Covers the classes and enums as well as their members, so an enum whose name you do not
+        know is one search away rather than a dead end.
 
         Returns:
-            dict with cyclomatic_complexity, basic_blocks, size, callers_count, callees_count or
-            None if function not found
+            [{name, kind, signature, summary}, ...] where name is what describe() accepts
         """
-        f = self._resolve_function(func)
-        if not f:
-            return None
+        terms = query.lower().split()
+        entries = [
+            _describe_member(name, member) for name, member in _binaryninja_members().items()
+        ]
+        entries += [_summarise_class(name, cls) for name, cls in _binaryninja_types().items()]
+        matches = [
+            entry
+            for entry in entries
+            if all(
+                term in entry["name"].lower() or term in entry["summary"].lower() for term in terms
+            )
+        ]
+        matches.sort(key=lambda entry: entry["name"])
+        return matches[: max(0, limit)]
 
-        # Calculate cyclomatic complexity (edges - nodes + 2)
-        if f.hlil:
-            edges = sum(len(block.outgoing_edges) for block in f.hlil.basic_blocks)
-            nodes = len(f.hlil.basic_blocks)
-            complexity = edges - nodes + 2
-        else:
-            complexity = 0
+    def describe(self, name: str) -> dict:
+        """Full signature and docstring for one Binary Ninja API member, class or enum.
 
+        Takes a qualified name like "BinaryView.read", a bare one like "read", or a class name
+        like "Symbol". A bare name that sits on several types resolves to the most central one
+        and reports the rest. A class answers with its constructor signature, and an enum with
+        its members, because "how do I build one of these" is the question a member cannot
+        answer.
+
+        Returns:
+            {name, kind, signature, doc}, plus also_defined_on for an ambiguous bare name or members for an enum
+        """
+        members = _binaryninja_members()
+        others = []
+        if name not in members:
+            cls = _resolve_class_name(name)
+            if cls is not None:
+                return _describe_class(name, cls)
+            name, others = _resolve_member_name(name, members)
+        detail = _describe_member(name, members[name], summary_only=False)
+        if others:
+            detail["also_defined_on"] = others
+        return detail
+
+
+# Where search_api() and describe() look, plus the module's own top-level functions. This is the
+# escape hatch the whole design leans on: the wrapper methods cover the common path, and anything
+# they do not cover has to be findable here or it is a dead end. So the list covers the types the
+# model actually threads through when it leaves the wrapper, not just the ones the wrapper itself
+# uses. A name absent from the running version is skipped rather than raising, so listing a type
+# that some builds do not ship costs nothing.
+#
+# Deliberately absent: Settings, TypeLibrary, Component and FlowGraph configure or extend Binary
+# Ninja rather than describe a binary, and none of them come up in analysis code.
+_DISCOVERY_ROOTS = (
+    # Core
+    "BinaryView",
+    "Function",
+    "BasicBlock",
+    "Architecture",
+    "Platform",
+    "FileMetadata",
+    # Data and references
+    "Variable",
+    "DataVariable",
+    "Section",
+    "Segment",
+    "Symbol",
+    "StringReference",
+    "ReferenceSource",
+    # Types
+    "Type",
+    "NamedTypeReferenceType",
+    "StructureBuilder",
+    "EnumerationBuilder",
+    "TypeParser",
+    # Intermediate languages
+    "LowLevelILFunction",
+    "MediumLevelILFunction",
+    "HighLevelILFunction",
+    "LowLevelILInstruction",
+    "MediumLevelILInstruction",
+    "HighLevelILInstruction",
+    # Enums worth spelling out, since a wrong member is a silent empty result
+    "SymbolType",
+    "SymbolBinding",
+    # Tags, raw IO and rendering
+    "Tag",
+    "TagType",
+    "BinaryReader",
+    "BinaryWriter",
+    "InstructionTextToken",
+)
+
+
+def _binaryninja_members() -> dict:
+    """Map 'Class.member' to the member, over the roots worth searching.
+
+    Read from the installed binaryninja module rather than a checked-in list, so it describes
+    whichever version is running and never needs regenerating.
+    """
+    import inspect
+
+    import binaryninja
+
+    catalog = {}
+    for root in _DISCOVERY_ROOTS:
+        cls = getattr(binaryninja, root, None)
+        if cls is None:
+            continue
+        for name, member in inspect.getmembers(cls):
+            if not name.startswith("_"):
+                catalog[f"{root}.{name}"] = member
+
+    for name, member in inspect.getmembers(binaryninja, inspect.isfunction):
+        if not name.startswith("_"):
+            catalog[f"binaryninja.{name}"] = member
+
+    return catalog
+
+
+def _binaryninja_types() -> dict:
+    """Map every class and enum the module exposes to itself, so search can match a bare type name.
+
+    The member catalogue is keyed "Class.member" and so could never match one, which left
+    search_api() unable to find a class or an enum at all - including the enums the guide tells the
+    model to look up rather than guess a member of. describe() already answers for a type; this is
+    what makes one findable without knowing its name first.
+    """
+    import inspect
+
+    import binaryninja
+
+    return {
+        name: member
+        for name, member in inspect.getmembers(binaryninja, inspect.isclass)
+        if not name.startswith("_")
+    }
+
+
+_FORWARD_REF = re.compile(r"ForwardRef\('([^']+)'\)")
+
+
+def _describe_member(name: str, member, summary_only: bool = True) -> dict:
+    import inspect
+
+    if isinstance(member, property):
+        kind, signature = "property", ""
+        doc = inspect.getdoc(member.fget) or inspect.getdoc(member) or ""
+    else:
+        kind = "method" if callable(member) else "attribute"
+        try:
+            signature = str(inspect.signature(member))
+        except Exception:
+            # Some Binary Ninja annotations fail to resolve at introspection time. A missing
+            # signature is worth far less than losing the member from the catalogue entirely.
+            signature = ""
+        doc = inspect.getdoc(member) or ""
+
+    entry = {"name": name, "kind": kind, "signature": _FORWARD_REF.sub(r"\1", signature)}
+    if summary_only:
+        lines = [line for line in doc.splitlines() if line.strip()]
+        entry["summary"] = lines[0] if lines else ""
+    else:
+        entry["doc"] = doc
+    return entry
+
+
+def _summarise_class(name: str, cls) -> dict:
+    """One search result for a class or an enum, in the shape a member's result takes."""
+    import enum
+    import inspect
+
+    doc = [line for line in (inspect.getdoc(cls) or "").splitlines() if line.strip()]
+    return {
+        "name": name,
+        "kind": "enum" if issubclass(cls, enum.Enum) else "class",
+        "signature": "",
+        "summary": doc[0] if doc else "",
+    }
+
+
+def _resolve_class_name(name: str):
+    """The class object for a bare class name, or None if the name is not one.
+
+    Read off the binaryninja module rather than _DISCOVERY_ROOTS, so a type that only ever
+    appears in an annotation - CoreSymbol, say - still answers.
+    """
+    import inspect
+
+    import binaryninja
+
+    cls = getattr(binaryninja, name, None)
+    return cls if inspect.isclass(cls) else None
+
+
+def _describe_class(name: str, cls) -> dict:
+    """Constructor signature for a class, member list for an enum.
+
+    An enum's __init__ is int's and says nothing; the members are the whole point, and passing a
+    wrong one is a silent empty result rather than an error.
+    """
+    import enum
+    import inspect
+
+    doc = inspect.getdoc(cls) or ""
+
+    if issubclass(cls, enum.Enum):
         return {
-            "name": f.name,
-            "address": f.start,
-            "size": f.total_bytes,
-            "basic_blocks": len(f.basic_blocks),
-            "cyclomatic_complexity": complexity,
-            "callers_count": len(f.callers),
-            "callees_count": len(f.callees),
-            "instruction_count": sum(len(block) for block in f.basic_blocks),
+            "name": name,
+            "kind": "enum",
+            "signature": "",
+            "doc": doc,
+            "members": [member.name for member in cls],
         }
+
+    try:
+        signature = str(inspect.signature(cls))
+    except (TypeError, ValueError):
+        # Some Binary Ninja classes are constructed by the core and expose no Python __init__.
+        signature = ""
+    return {
+        "name": name,
+        "kind": "class",
+        "signature": _FORWARD_REF.sub(r"\1", signature),
+        "doc": doc,
+    }
+
+
+def _resolve_member_name(name: str, members: dict) -> tuple[str, list[str]]:
+    """Accept a bare member name, so describe('get_functions_containing') works.
+
+    Roughly a third of bare names sit on more than one type, and refusing to answer without a
+    qualified name costs a round trip to learn something the caller usually did not care about.
+    Ties break towards the earliest entry in _DISCOVERY_ROOTS, which is ordered by how central the
+    type is to analysis code, so a bare name lands on BinaryView before FileMetadata. The result
+    is qualified and names the types that lost the tie, so the choice is visible rather than
+    silent.
+    """
+    order = {root: index for index, root in enumerate(_DISCOVERY_ROOTS)}
+    candidates = sorted(
+        (key for key in members if key.split(".")[-1] == name),
+        key=lambda key: (order.get(key.split(".")[0], len(order)), key),
+    )
+    if not candidates:
+        raise BinjaAPIError(
+            f"No Binary Ninja API member or class named {name!r}. Use search_api() to find one."
+        )
+    return candidates[0], candidates[1:]

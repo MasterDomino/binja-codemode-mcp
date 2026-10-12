@@ -1,4 +1,5 @@
 .zed
 pyrightconfig.json
 __pycache__/
-*.pyc
+*.py[cod]
+.ruff_cache/

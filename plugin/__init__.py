@@ -20,6 +20,8 @@ class BinjaCodeModeMCP:
         self._config = None
         self._server = None
         self._components = None
+        self._workspace_dir = None
+        self._bv = None
 
     def _lazy_import(self):
         """Lazily import components to avoid loading at registration time."""
@@ -27,22 +29,20 @@ class BinjaCodeModeMCP:
             return self._components
 
         from ..config import Config
-        from ..stubs import generate_api_stubs
+        from . import tools
         from .api import BinjaAPI
         from .executor import CodeExecutor
         from .server import MCPServer
-        from .state import StateTracker
         from .workspace import SkillsManager, WorkspaceManager
 
         self._components = {
             "BinjaAPI": BinjaAPI,
-            "StateTracker": StateTracker,
             "CodeExecutor": CodeExecutor,
             "WorkspaceManager": WorkspaceManager,
             "SkillsManager": SkillsManager,
             "MCPServer": MCPServer,
             "Config": Config,
-            "generate_api_stubs": generate_api_stubs,
+            "tools": tools,
         }
         return self._components
 
@@ -62,38 +62,49 @@ class BinjaCodeModeMCP:
 
             self._config = components["Config"]()
             self._config.ensure_dirs()
+            self._workspace_dir = self._config.workspace_dir_for(bv)
+            self._bv = bv
 
-            # Initialize components
-            state = components["StateTracker"](bv, self._config.enable_state_tracking)
-            workspace = components["WorkspaceManager"](self._config.workspace_dir)
-            skills = components["SkillsManager"](self._config.skills_dir)
-            api = components["BinjaAPI"](bv, state, workspace, skills)
+            # What the executed code gets as globals, and what the tool description is rendered
+            # from. One mapping feeds both, so the two cannot disagree.
+            namespaces = {
+                "binja": components["BinjaAPI"](bv),
+                "workspace": components["WorkspaceManager"](self._workspace_dir),
+                "skills": components["SkillsManager"](self._config.skills_dir),
+            }
             executor = components["CodeExecutor"](
-                api,
-                max_output_bytes=self._config.max_output_bytes,
+                namespaces,
+                bv,
+                max_output_tokens=self._config.max_output_tokens,
                 timeout=self._config.execution_timeout_s,
             )
 
-            def get_stubs(self=None):
-                return components["generate_api_stubs"](bv, state, workspace, skills)
+            def get_tools():
+                return [components["tools"].build_tool_definition(namespaces)]
 
-            self._server = components["MCPServer"](
-                api, state, executor, workspace, skills, self._config, get_stubs
-            )
+            self._server = components["MCPServer"](executor, self._config, get_tools)
             url = self._server.start()
 
             log_info("=" * 42)
             log_info("Code Mode MCP Server Started")
             log_info(f"  URL: {url}")
+            log_info(f"  Workspace: {self._workspace_dir}")
+            self._report_unclaimed_workspace_files()
             log_info(f"  API Key: {self._config.api_key}")
             log_info("=" * 42)
-            log_info("Configure your MCP client with the above credentials.")
-            update_status(True)
+            log_info("Register it with an MCP client that speaks HTTP, for example:")
+            log_info(
+                f"  claude mcp add binja-codemode-mcp -s user --transport http {url} "
+                f'--header "Authorization: Bearer {self._config.api_key}"'
+            )
+            update_status()
         except Exception as e:
             log_error(f"Failed to start Code Mode MCP server: {e}")
             self._server = None
             self._config = None
-            update_status(False)
+            self._workspace_dir = None
+            self._bv = None
+            update_status()
 
     def stop_server(self, bv):
         """Stop MCP server."""
@@ -105,8 +116,10 @@ class BinjaCodeModeMCP:
             self._server.stop()
             self._server = None
             self._config = None
+            self._workspace_dir = None
+            self._bv = None
             log_info("Code Mode MCP server stopped.")
-            update_status(False)
+            update_status()
         except Exception as e:
             log_error(f"Failed to stop Code Mode MCP server: {e}")
 
@@ -125,14 +138,38 @@ class BinjaCodeModeMCP:
             return
 
         log_info("Code Mode MCP server: RUNNING")
-        log_info(f"  URL: http://{self._config.host}:{self._config.port}")
-        log_info(f"  Workspace: {self._config.workspace_dir}")
+        log_info(f"  URL: {self._server.url}")
+        log_info(f"  Workspace: {self._workspace_dir}")
         log_info(f"  Skills: {self._config.skills_dir}")
+
+    def _report_unclaimed_workspace_files(self) -> None:
+        """Point at files left in the workspace root by the versions before it was per-binary.
+
+        They are not deleted or moved: which binary each belongs to is not recoverable, and
+        guessing wrong would file someone's report under the wrong binary. Naming the directory
+        once at startup is enough for them to be moved by hand.
+        """
+        root = self._config.workspace_dir
+        stranded = [path for path in root.iterdir() if path.is_file()] if root.is_dir() else []
+        if stranded:
+            log_info(
+                f"  {len(stranded)} workspace file(s) predate per-binary workspaces and belong to "
+                f"no binary: {root}. Move them into a binary's folder to use them."
+            )
 
     @property
     def is_running(self) -> bool:
         """Check if server is currently running."""
         return self._server is not None
+
+    @property
+    def served_view(self):
+        """The BinaryView the running server executes against, or None when it is not running.
+
+        One server serves one view, so a second window's binary is not reachable through it. The
+        status indicator names this one rather than reporting a bare "Running" in every window.
+        """
+        return self._bv if self._server is not None else None
 
     def register_commands(self) -> None:
         """Register plugin commands with Binary Ninja."""

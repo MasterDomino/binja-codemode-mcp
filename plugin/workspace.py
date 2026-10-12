@@ -4,7 +4,6 @@ import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
 
 # Valid filename pattern: alphanumeric, underscore, hyphen, dot
 _VALID_FILENAME = re.compile(r"^[\w\-\.]+$")
@@ -17,9 +16,13 @@ def _validate_name(name: str) -> bool:
         return False
     if not _VALID_FILENAME.match(name):
         return False
-    if ".." in name or name.startswith("/") or name.startswith("\\"):
+    if name.startswith("."):
+        # "." and ".." name a directory rather than a file - writing to "." raised
+        # IsADirectoryError where every other rejected name answers False - and list() does not
+        # show a dotfile, so writing one put a file in the workspace the workspace never admitted
+        # to holding.
         return False
-    return True
+    return ".." not in name and not name.startswith(("/", "\\"))
 
 
 @dataclass
@@ -32,7 +35,7 @@ class Skill:
 
 
 class WorkspaceManager:
-    """Manages workspace files for the current session."""
+    """Workspace files, for carrying results between calls."""
 
     def __init__(self, workspace_dir: Path):
         self._dir = workspace_dir
@@ -49,7 +52,7 @@ class WorkspaceManager:
         path.write_text(content, encoding="utf-8")
         return True
 
-    def read(self, name: str) -> Optional[str]:
+    def read(self, name: str) -> str | None:
         """Read content from workspace file."""
         if not _validate_name(name):
             return None
@@ -60,8 +63,15 @@ class WorkspaceManager:
 
         return path.read_text(encoding="utf-8")
 
-    def list(self) -> list[dict]:
-        """List all workspace files with metadata."""
+    def list(self) -> "list[dict]":
+        """List all workspace files with metadata.
+
+        Quoted annotation: `list` is this method's own name, so an unquoted `list[dict]` resolves
+        to the method rather than the builtin when annotations are read.
+
+        Returns:
+            [{name, size, modified}, ...]
+        """
         files = []
         for path in self._dir.iterdir():
             if path.is_file() and not path.name.startswith("."):
@@ -88,17 +98,20 @@ class WorkspaceManager:
         return True
 
     def clear(self) -> int:
-        """Clear all workspace files. Returns count deleted."""
-        count = 0
-        for path in self._dir.iterdir():
-            if path.is_file():
-                path.unlink()
-                count += 1
-        return count
+        """Clear all workspace files. Returns count deleted.
+
+        Over what list() shows, so the count matches what was there: iterating the directory
+        deleted the dotfiles list() hides and counted them, reporting more files than the
+        workspace ever admitted to having.
+        """
+        names = [entry["name"] for entry in self.list()]
+        for name in names:
+            (self._dir / name).unlink()
+        return len(names)
 
 
 class SkillsManager:
-    """Manages reusable code skills that persist across sessions."""
+    """Reusable analysis code, saved across sessions."""
 
     def __init__(self, skills_dir: Path):
         self._dir = skills_dir
@@ -123,7 +136,7 @@ class SkillsManager:
         path.write_text(json.dumps(skill_data, indent=2), encoding="utf-8")
         return True
 
-    def load(self, name: str) -> Optional[Skill]:
+    def load(self, name: str) -> Skill | None:
         """Load a skill by name."""
         if not _validate_name(name):
             return None
@@ -142,8 +155,15 @@ class SkillsManager:
         except (json.JSONDecodeError, KeyError):
             return None
 
-    def list(self) -> list[dict]:
-        """List all skills with descriptions."""
+    def list(self) -> "list[dict]":
+        """List all skills with descriptions.
+
+        Quoted annotation: `list` is this method's own name, so an unquoted `list[dict]` resolves
+        to the method rather than the builtin when annotations are read.
+
+        Returns:
+            [{name, description}, ...]
+        """
         skills = []
         for path in self._dir.glob("*.json"):
             try:
@@ -170,7 +190,7 @@ class SkillsManager:
         path.unlink()
         return True
 
-    def get_code(self, name: str) -> Optional[str]:
+    def get_code(self, name: str) -> str | None:
         """Get just the code for a skill."""
         skill = self.load(name)
         return skill.code if skill else None
