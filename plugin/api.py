@@ -618,18 +618,20 @@ class BinjaAPI:
         return results
 
     def get_data_xrefs_to(self, addr: int) -> list[dict]:
-        """Get cross-references to data address."""
+        """Get data references to an address: the data that points at it.
+
+        Code references are not included; get_xrefs_to() reports those.
+        """
         results = []
-        for ref in self._bv.get_code_refs(addr):
-            caller = self._bv.get_functions_containing(ref.address)
-            if caller:
-                results.append(
-                    {
-                        "from_function": caller[0].name,
-                        "from_address": ref.address,
-                        "from_address_hex": f"{ref.address:#x}",
-                    }
-                )
+        for ref in self._bv.get_data_refs(addr):
+            source = self._bv.get_functions_containing(ref)
+            results.append(
+                {
+                    "from_function": source[0].name if source else None,
+                    "from_address": ref,
+                    "from_address_hex": f"{ref:#x}",
+                }
+            )
         return results
 
     def get_data_xrefs_from(self, addr: int) -> list[dict]:

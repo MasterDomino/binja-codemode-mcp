@@ -4,7 +4,7 @@ MCP Status Widget for Binary Ninja status bar.
 Provides a clickable status indicator showing MCP server state.
 """
 
-from binaryninja import execute_on_main_thread
+from binaryninja import UIPluginInHeadlessError, execute_on_main_thread
 from binaryninja.log import log_debug, log_error, log_info
 
 try:
@@ -14,7 +14,8 @@ try:
     from shiboken6 import isValid
 
     _HAS_UI = True
-except ImportError:
+except (ImportError, UIPluginInHeadlessError):
+    # binaryninjaui raises UIPluginInHeadlessError, which is not an ImportError.
     _HAS_UI = False
 
 
